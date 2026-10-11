@@ -25,5 +25,5 @@ jobs:
           file: Dockerfile.custom
           push: true
           tags: |
-            ghcr.io/${{ github.repository }}:0.7.6-alpha.5-kraken1
+            ghcr.io/${{ github.repository }}:0.7.6-alpha.5-kraken2
             ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
