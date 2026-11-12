@@ -21,7 +21,7 @@ class KrakenItem::Importer
     pair_metadata = kraken_provider.get_asset_pairs || {}
     balances = kraken_provider.get_extended_balance || {}
     assets = parse_assets(balances, asset_metadata)
-    assets += fetch_and_parse_earn_assets(asset_metadata)
+    assets += fetch_and_parse_earn_assets(asset_metadata, spot_assets: assets)
     trades = fetch_trades
     ledgers = fetch_ledgers
 
@@ -107,9 +107,9 @@ class KrakenItem::Importer
     # would delete real principal from the account on a transient error; the
     # carried assets are stale until the next successful sync, which beats
     # gone. Same pattern as BinanceItem::Importer#carried_over_assets.
-    def fetch_and_parse_earn_assets(asset_metadata)
+    def fetch_and_parse_earn_assets(asset_metadata, spot_assets: [])
       items = fetch_earn_allocations
-      parse_earn_assets(items, asset_metadata)
+      net_of_spot(parse_earn_assets(items, asset_metadata), spot_assets)
     rescue Provider::Kraken::Error, EarnAllocationsUnavailable, Timeout::Error, SocketError,
            OpenSSL::SSL::SSLError, SystemCallError => e
       # Provider::Kraken::Error covers every classified Kraken error
@@ -183,6 +183,33 @@ class KrakenItem::Importer
       # instead routes it through #fetch_and_parse_earn_assets' carry-forward,
       # same as a fetch failure.
       raise EarnAllocationsUnavailable, "could not parse Earn allocation: #{e.message}"
+    end
+
+    # Bonded/auto-earn funds sit in BalanceEx as staking variants (ETH.B, SOL.F)
+    # and Earn/Allocations lists them again; hybrid Earn is in Allocations only.
+    def net_of_spot(earn_assets, spot_assets)
+      spot_left = Hash.new(0.to_d)
+      spot_assets.each do |asset|
+        symbol = asset[:symbol].to_s.upcase
+        next unless symbol.match?(KrakenAccount::SecurityResolver::STAKING_SUFFIX)
+
+        spot_left[KrakenAccount::SecurityResolver.canonical_asset(symbol)] += asset[:balance].to_d
+      end
+
+      earn_assets.filter_map do |asset|
+        canonical = KrakenAccount::SecurityResolver.canonical_asset(asset[:symbol])
+        covered = [ spot_left[canonical], asset[:balance].to_d ].min
+        spot_left[canonical] -= covered
+        remaining = asset[:balance].to_d - covered
+        next if remaining.zero?
+
+        price_usd = asset[:price_usd]&.to_d
+        asset.merge(
+          balance: remaining.to_s("F"),
+          hold_trade: remaining.to_s("F"),
+          amount_usd: (price_usd ? (remaining * price_usd).round(2) : 0.to_d).to_s("F")
+        )
+      end
     end
 
     def fetch_earn_allocations

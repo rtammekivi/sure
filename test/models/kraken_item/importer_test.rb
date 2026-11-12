@@ -43,6 +43,30 @@ class KrakenItem::ImporterTest < ActiveSupport::TestCase
     assert_equal "0.25", btc["hold_trade"]
   end
 
+  test "does not count bonded staking twice when Earn/Allocations also lists it" do
+    @provider.stubs(:get_asset_info).returns(asset_metadata.merge("ETH.B" => { "altname" => "ETH.B" }))
+    @provider.stubs(:get_extended_balance).returns(
+      "ETH.B" => { "balance" => "8.4245", "credit" => "0", "credit_used" => "0", "hold_trade" => "0" },
+      "XETH" => { "balance" => "0.0005", "credit" => "0", "credit_used" => "0", "hold_trade" => "0" }
+    )
+    @provider.stubs(:get_earn_allocations).returns(
+      "items" => [
+        { "strategy_id" => "bonded", "native_asset" => "ETH", "amount_allocated" => { "total" => { "native" => "8.4245" } } },
+        { "strategy_id" => "vault", "native_asset" => "BTC", "amount_allocated" => { "total" => { "native" => "0.08" } } }
+      ]
+    )
+    @provider.stubs(:get_ticker).with("ETHUSD").returns("XETHZUSD" => { "c" => [ "2000.00" ] })
+    @provider.stubs(:get_ticker).with("XBTUSD").returns("XXBTZUSD" => { "c" => [ "50000.00" ] })
+
+    KrakenItem::Importer.new(@item, kraken_provider: @provider).import
+
+    assets = @item.kraken_accounts.first.raw_payload["assets"]
+    assert_nil assets.find { |asset| asset["source"] == "earn" && asset["symbol"] == "ETH" }
+    assert_equal "0.08", assets.find { |asset| asset["source"] == "earn" && asset["symbol"] == "BTC" }["balance"]
+    # 8.425 ETH @ $2,000 + 0.08 BTC @ $50,000
+    assert_in_delta 20_850, @item.kraken_accounts.first.current_balance, 0.01
+  end
+
   test "merges Earn allocated balances alongside spot assets" do
     @provider.stubs(:get_asset_info).returns(asset_metadata)
     # Includes a spot XXBT holding of the *same* asset Earn reports, so this
