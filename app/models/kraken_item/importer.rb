@@ -21,7 +21,7 @@ class KrakenItem::Importer
     pair_metadata = kraken_provider.get_asset_pairs || {}
     balances = kraken_provider.get_extended_balance || {}
     assets = parse_assets(balances, asset_metadata)
-    assets += fetch_and_parse_earn_assets(asset_metadata, spot_assets: assets)
+    assets += fetch_and_parse_earn_assets(asset_metadata)
     trades = fetch_trades
     ledgers = fetch_ledgers
 
@@ -93,11 +93,9 @@ class KrakenItem::Importer
     # forward the last known-good values instead of saving an undercount.
     EarnAllocationsUnavailable = Class.new(StandardError)
 
-    # Earn's allocated principal (staking/bonding) lives in a sub-ledger
-    # BalanceEx never reports -- see Provider::Kraken#get_earn_allocations.
-    # Without this, only Earn's reward payouts (ordinary Ledgers entries,
-    # handled in KrakenAccount::LedgerProcessor) were ever visible; the
-    # locked balance itself was invisible to holdings.
+    # Only allocations outside Earn/Strategies (hybrid Earn, e.g. the Bitcoin
+    # vault) are missing from BalanceEx; the rest are already counted there
+    # as ETH.B, auto-earn spot, etc. -- see Provider::Kraken#get_earn_allocations.
     #
     # On any failure -- the fetch itself (permission denied, a transient API
     # error on any page) or one malformed item among otherwise-good ones --
@@ -107,9 +105,10 @@ class KrakenItem::Importer
     # would delete real principal from the account on a transient error; the
     # carried assets are stale until the next successful sync, which beats
     # gone. Same pattern as BinanceItem::Importer#carried_over_assets.
-    def fetch_and_parse_earn_assets(asset_metadata, spot_assets: [])
+    def fetch_and_parse_earn_assets(asset_metadata)
       items = fetch_earn_allocations
-      net_of_spot(parse_earn_assets(items, asset_metadata), spot_assets)
+      listed = fetch_earn_strategy_ids
+      parse_earn_assets(items.reject { |item| listed.include?(item["strategy_id"]) }, asset_metadata)
     rescue Provider::Kraken::Error, EarnAllocationsUnavailable, Timeout::Error, SocketError,
            OpenSSL::SSL::SSLError, SystemCallError => e
       # Provider::Kraken::Error covers every classified Kraken error
@@ -185,31 +184,21 @@ class KrakenItem::Importer
       raise EarnAllocationsUnavailable, "could not parse Earn allocation: #{e.message}"
     end
 
-    # Bonded/auto-earn funds sit in BalanceEx as staking variants (ETH.B, SOL.F)
-    # and Earn/Allocations lists them again; hybrid Earn is in Allocations only.
-    def net_of_spot(earn_assets, spot_assets)
-      spot_left = Hash.new(0.to_d)
-      spot_assets.each do |asset|
-        symbol = asset[:symbol].to_s.upcase
-        next unless symbol.match?(KrakenAccount::SecurityResolver::STAKING_SUFFIX)
+    def fetch_earn_strategy_ids
+      cursor = nil
+      ids = Set.new
 
-        spot_left[KrakenAccount::SecurityResolver.canonical_asset(symbol)] += asset[:balance].to_d
+      MAX_EARN_PAGES.times do
+        result = kraken_provider.get_earn_strategies(cursor: cursor)
+        items = result.is_a?(Hash) ? result["items"] : nil
+        raise EarnAllocationsUnavailable, "Earn strategy items must be an array" unless items.is_a?(Array)
+
+        items.each { |item| ids << item["id"] if item.is_a?(Hash) && item["id"].present? }
+        cursor = result["next_cursor"].presence
+        break if cursor.blank?
       end
 
-      earn_assets.filter_map do |asset|
-        canonical = KrakenAccount::SecurityResolver.canonical_asset(asset[:symbol])
-        covered = [ spot_left[canonical], asset[:balance].to_d ].min
-        spot_left[canonical] -= covered
-        remaining = asset[:balance].to_d - covered
-        next if remaining.zero?
-
-        price_usd = asset[:price_usd]&.to_d
-        asset.merge(
-          balance: remaining.to_s("F"),
-          hold_trade: remaining.to_s("F"),
-          amount_usd: (price_usd ? (remaining * price_usd).round(2) : 0.to_d).to_s("F")
-        )
-      end
+      ids
     end
 
     def fetch_earn_allocations

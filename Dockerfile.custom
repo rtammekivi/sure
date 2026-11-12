@@ -1,2 +1,3 @@
 FROM ghcr.io/we-promise/sure:0.7.7-alpha.5
 COPY --chown=1000:1000 app/models/kraken_item/importer.rb /rails/app/models/kraken_item/importer.rb
+COPY --chown=1000:1000 app/models/provider/kraken.rb /rails/app/models/provider/kraken.rb
